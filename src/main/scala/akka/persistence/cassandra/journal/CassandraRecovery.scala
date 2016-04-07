@@ -53,13 +53,11 @@ trait CassandraRecovery extends ActorLogging {
     }
 
   private def asyncFindHighestSequenceNr(persistenceId: String, fromSequenceNr: Long): Future[Long] = {
-    import cassandraSession._
 
     def find(currentPnr: Long, currentSnr: Long): Future[Long] = {
       // if every message has been deleted and thus no sequence_nr the driver gives us back 0 for "null" :(
-      listenableFutureToFuture(
-        session.executeAsync(preparedSelectHighestSequenceNr.bind(persistenceId, currentPnr: JLong))
-      )
+      val boundSelectHighestSequenceNr = preparedSelectHighestSequenceNr.map(_.bind(persistenceId, currentPnr: JLong))
+      boundSelectHighestSequenceNr.flatMap(session.select)
         .map { rs =>
           Option(rs.one()).map { row =>
             (row.getBool("used"), row.getLong("sequence_nr"))
@@ -79,8 +77,9 @@ trait CassandraRecovery extends ActorLogging {
     find(partitionNr(fromSequenceNr), fromSequenceNr)
   }
 
-  private[this] def asyncHighestDeletedSequenceNumber(partitionKey: String): Future[Long] = {
-    listenableFutureToFuture(session.executeAsync(cassandraSession.preparedSelectDeletedTo.bind(partitionKey)))
+  def asyncHighestDeletedSequenceNumber(persistenceId: String): Future[Long] = {
+    val boundSelectDeletedTo = preparedSelectDeletedTo.map(_.bind(persistenceId))
+    boundSelectDeletedTo.flatMap(session.select)
       .map(r => Option(r.one()).map(_.getLong("deleted_to")).getOrElse(0))
   }
 }

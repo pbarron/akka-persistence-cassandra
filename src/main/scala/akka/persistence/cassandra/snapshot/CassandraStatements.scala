@@ -3,6 +3,12 @@
  */
 package akka.persistence.cassandra.snapshot
 
+import com.datastax.driver.core.Session
+import scala.concurrent.ExecutionContext
+import scala.concurrent.Future
+import akka.persistence.cassandra.CassandraSession
+import akka.Done
+
 trait CassandraStatements {
   def config: CassandraSnapshotStoreConfig
 
@@ -50,4 +56,28 @@ trait CassandraStatements {
     """
 
   private def tableName = s"${config.keyspace}.${config.table}"
+
+  /**
+   * Execute creation of keyspace and tables is limited to one thread at a time to
+   * reduce the risk of (annoying) "Column family ID mismatch" exception
+   * when write and read-side plugins are started at the same time.
+   * Those statements are retried, because that could happen across different
+   * nodes also but synchronizing those statements gives a better "experience".
+   */
+  def executeCreateKeyspaceAndTables(session: Session, keyspaceAutoCreate: Boolean)(implicit ec: ExecutionContext): Future[Done] = {
+    import akka.persistence.cassandra.listenableFutureToFuture
+    CassandraSession.createKeyspaceAndTablesSemaphore.acquire()
+
+    val keyspace: Future[Done] =
+      if (keyspaceAutoCreate) session.executeAsync(createKeyspace).map(_ => Done)
+      else Future.successful(Done)
+
+    val result = keyspace.flatMap(_ => session.executeAsync(createTable)).map(_ => Done)
+
+    result.onComplete {
+      case _ => CassandraSession.createKeyspaceAndTablesSemaphore.release()
+    }
+
+    result
+  }
 }

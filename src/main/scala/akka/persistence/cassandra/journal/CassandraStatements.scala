@@ -4,10 +4,12 @@
 package akka.persistence.cassandra.journal
 
 import com.datastax.driver.core.Session
-
-private object CassandraStatements {
-  val createKeyspaceAndTablesLock = new Object
-}
+import scala.concurrent.ExecutionContext
+import scala.concurrent.Future
+import akka.Done
+import scala.collection.JavaConverters._
+import java.util.concurrent.Semaphore
+import akka.persistence.cassandra.CassandraSession
 
 trait CassandraStatements {
   def config: CassandraJournalConfig
@@ -143,7 +145,7 @@ trait CassandraStatements {
   private def eventsByTagViewName = s"${config.keyspace}.${config.eventsByTagView}"
 
   /**
-   * Execute creation of keyspace and tables in synchronized block to
+   * Execute creation of keyspace and tables is limited to one thread at a time
    * reduce the risk of (annoying) "Column family ID mismatch" exception
    * when write and read-side plugins are started at the same time.
    * Those statements are retried, because that could happen across different
@@ -151,14 +153,63 @@ trait CassandraStatements {
    *
    * The materialized view for eventsByTag query is not created if `maxTagId` is 0.
    */
-  def executeCreateKeyspaceAndTables(session: Session, keyspaceAutoCreate: Boolean, maxTagId: Int): Unit =
-    CassandraStatements.createKeyspaceAndTablesLock.synchronized {
-      if (keyspaceAutoCreate)
-        session.execute(createKeyspace)
-      session.execute(createTable)
-      session.execute(createMetatdataTable)
-      session.execute(createConfigTable)
-      for (tagId <- 1 to maxTagId)
-        session.execute(createEventsByTagMaterializedView(tagId))
+  def executeCreateKeyspaceAndTables(session: Session, keyspaceAutoCreate: Boolean,
+                                     maxTagId: Int)(implicit ec: ExecutionContext): Future[Done] = {
+    import akka.persistence.cassandra.listenableFutureToFuture
+    CassandraSession.createKeyspaceAndTablesSemaphore.acquire()
+
+    val keyspace: Future[Done] =
+      if (keyspaceAutoCreate) session.executeAsync(createKeyspace).map(_ => Done)
+      else Future.successful(Done)
+
+    val tables = for {
+      _ <- keyspace
+      _ <- session.executeAsync(createTable)
+      _ <- session.executeAsync(createMetatdataTable)
+      done <- session.executeAsync(createConfigTable).map(_ => Done)
+    } yield done
+
+    def createTag(todo: List[String]): Future[Done] =
+      todo match {
+        case create :: remainder => session.executeAsync(create).flatMap(_ => createTag(remainder))
+        case Nil                 => Future.successful(Done)
+      }
+
+    val createTagStmts = (1 to maxTagId).map(createEventsByTagMaterializedView).toList
+    val result = tables.flatMap(_ => createTag(createTagStmts))
+
+    result.onComplete {
+      case _ => CassandraSession.createKeyspaceAndTablesSemaphore.release()
     }
+
+    result
+  }
+
+  def initializePersistentConfig(session: Session)(implicit ec: ExecutionContext): Future[Map[String, String]] = {
+    import akka.persistence.cassandra.listenableFutureToFuture
+    session.executeAsync(selectConfig)
+      .flatMap { rs =>
+        val properties = rs.all.asScala.map(row => (row.getString("property"), row.getString("value"))).toMap
+        val result = properties.get(CassandraJournalConfig.TargetPartitionProperty) match {
+          case Some(oldValue) =>
+            assertCorrectPartitionSize(oldValue)
+            Future.successful(properties)
+          case None =>
+            session.executeAsync(writeConfig, CassandraJournalConfig.TargetPartitionProperty, config.targetPartitionSize.toString)
+              .map(_ => properties.updated(CassandraJournalConfig.TargetPartitionProperty, config.targetPartitionSize.toString))
+        }
+        result.flatMap { properties =>
+          session.executeAsync(writeConfig, CassandraJournalConfig.TargetPartitionProperty, config.targetPartitionSize.toString)
+            .map { rs =>
+              if (!rs.wasApplied())
+                Option(rs.one).map(_.getString("value")).foreach(assertCorrectPartitionSize)
+              properties
+            }
+        }
+      }
+
+  }
+
+  private def assertCorrectPartitionSize(size: String) =
+    require(size.toInt == config.targetPartitionSize, "Can't change target-partition-size")
 }
